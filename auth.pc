@@ -1,0 +1,307 @@
+#include "auth.h"
+#include "cardco.h"
+// #include "fila.h"
+#include <sqlca.h>
+#include <sqlda.h>
+#include <sqlcpr.h>
+#define SQLCA_STORAGE_CLASS extern
+#define ORACA_STORAGE_CLASS extern
+#define FORMOUTQ        2
+#define AUTHQ           3
+struct		cardco		authmsg = {0,};
+struct internalmsg	*msg;
+struct auth		authArea, *authP;
+extern int leFila(int tipo, unsigned char * buf, int len);
+extern int gravaFila(int tipo, char *buf, int len);
+extern char *__itoa (unsigned int value, char *string, unsigned int tam);
+extern void logMsgSetPrefix(char * pfx);
+extern void logMsg(const char * format, ...);
+extern void debug(const char * format, ...);
+extern void debugOn(const char * filename);
+extern int printIMsg(struct internalmsg *msg);
+void auth(struct cardco * authmsg);
+void authTerm(int term );
+int initAuth();
+char * getDateTime(char * tmp);
+char * authRequest();
+int authorize( struct internalmsg * authmsg , struct auth *authP);
+int prepareAuthorization();
+int prepareResponse(char * resp);
+char * authRequest(int route, char * authreq, char * authresp);
+int connectDB(char * user, char * pwd, char * host, char * database, char *nome);
+void stripTraillingBlanks(char * str);
+exec sql begin declare section;
+char request[512], response[512],connAlfa[80], connJdSul[80];
+exec sql end   declare section;
+
+main(int argc, char *argv[])
+{
+	initAuth();
+	auth(&authmsg);
+
+}
+
+void authTerm(int term)
+{
+ 	exit(term);		
+}
+
+void auth(struct cardco * authmsg)
+{
+	char * reqPtr;
+	msg 	= &authmsg->msg;
+	authP	= &authArea;
+	int len;
+	for(;;) {
+		if(len = leFila(AUTHQ, (unsigned char *) msg , sizeof(authmsg))== -1) {
+			logMsg("Erro na gravacao da fila\n");
+			continue;
+		}
+		else {
+			printIMsg(msg);
+			
+			prepareAuthorization();
+			authorize(msg, authP);
+			
+			printIMsg(msg);
+			// authTerm(1);
+		}
+
+		if(gravaFila(FORMOUTQ, (char *) msg, sizeof(authmsg)) < 0) {
+			logMsg("Erro na gravacao da fila\n");
+		}
+
+	}
+}
+
+int initAuth()
+{
+	char user[80], pwd[80],host[80], conn[80];
+	
+	logMsgSetPrefix("Auth");
+	logMsg("Autorizador Iniciado");
+ // sql_connect("jardimsul", "jardimsul", "cardp001");   /* Teste */
+   //  sql_connect("alfa2", "alfa2", "cardp001");   /* Teste */
+	
+	debugOn("auth.debug");
+/*
+	strcpy (pwd ,"admc@orcl");
+	strcpy (user ,"admc");
+	strcpy (host ,(char *) HOST);
+	strcpy (conn ,(char *) CONNJDSUL);
+*/
+	strcpy (pwd ,"cardco");
+	strcpy (user ,"jardimsul");
+	strcpy (host ,(char *) HOST);
+	strcpy (conn ,"cardp001");
+	
+	if(connectDB(user, pwd,host,conn, (char *) CONNJDSUL ) < 0) {
+		logMsg("Erro de conexao Oracle");
+		authTerm(1);
+	}
+	strcpy (pwd ,"banco");
+	strcpy (user ,"alfa");
+	strcpy (host ,(char *) HOST);
+	strcpy (conn ,"cardp001");
+	if(connectDB(user, pwd,host,conn, (char *) CONNALFA ) < 0) {
+		logMsg("Erro de conexao Oracle");
+		authTerm(1);
+	}
+	logMsg("Conexao com Oracle Ok.");
+}
+
+int prepareAuthorization()
+{
+	char tmp[80] = {0,};
+	int result = SUCCESS;
+	debug("Prepare Authorization\n");	
+	memset(authP, 0x20, sizeof(authArea));
+       __itoa(msg->msgtype,authP->msgType,4);
+       __itoa(msg->pcode,authP->pcode,6);
+       memcpy(authP->nsu,msg->refnum,CARDCO_REFNUM_LEN);
+       authP->origem = 'P';
+       memcpy(authP->merchant, msg->termloc,12);
+       memcpy(authP->termid,msg->termid,CARDCO_TERMID_LEN);
+       __itoa((int) msg->merchant_type, authP->mcc,4);
+       memcpy(authP->pan,msg->pan,19);
+
+
+       memcpy(authP->expdate, (char *) msg->track2 + 1,4);
+       memcpy(authP->amount, msg->amount,12);
+       memcpy(authP->pin,msg->pin,8);
+       authP->tipoParc = msg->acceptorname[5];
+       memcpy(authP->qtdParc, (char *) (msg->acceptorname + 6), 2);
+       memcpy(authP->plano, (char *) (msg->acceptorname + 19), 5);
+
+}
+
+int prepareResponse(char * resp)
+{
+       char respcode[3];
+
+	debug("Prepare Response");
+       struct auth *authP;
+	authP = (struct auth *) resp;
+       memcpy(msg->authnum, authP->authcode,6);
+       memcpy(respcode, authP->respcode,2);
+       respcode[2] = '\0';
+       msg->respcode = atoi(respcode);
+
+}
+
+int authorize( struct internalmsg * authmsg, struct auth * authP  )
+{
+       
+       char bin[9];
+       int route = 0;
+	char * reqPtr;
+       char resp[512];
+       debug("Authorize\n");
+       memset(resp   , 0 , sizeof(resp) );
+       strncpy(bin, authmsg->pan, 6);
+       bin[6] = '\0';
+	debug("bin %s\n", bin);
+       switch(authmsg->msgtype){
+       case	CARDCO_AUTHREQ:
+       case	CARDCO_AUTHREQ_REPEAT:
+       case	CARDCO_AUTHREQ_ADVICE:
+       case	CARDCO_FINREQ:
+       case	CARDCO_FINREQ_REPEAT:
+       case	CARDCO_FINREQ_ADVICE:
+	       logMsg("\n   **** Venda ***** \n");
+	       if (strncmp(JARDIMSUL, bin, 6) == 0){
+		       route = 1;
+	       }
+	       else if (strncmp(ALFA, bin, 6) == 0)
+	       {
+		       route = 2;
+	       }
+	       break;
+       case	CARDCO_REVREQ:
+       case	CARDCO_REVREQ_REPEAT:
+       case	CARDCO_REVREQ_ADVICE:
+	       logMsg("\n   **** Reversão ***** \n");
+	       if (strcmp("00000301", bin) == 0){
+		       route = 2;
+	       }
+	       else
+	       {
+		       route = 1;
+	       }
+	       break;
+       }
+       prepareResponse(authRequest(route, (char *) authP,resp));
+       
+}
+
+char * authRequest(int route, char * authreq, char * authresp)
+{
+       char * respPtr;
+       char conexao[80];
+       int sqlcode = 0;
+	debug("authRequest\n");
+       strcpy(request, authreq);
+       strcpy(response, authresp);
+       
+       switch(route)
+       {
+       case 1:
+       	       logMsg(JDSULMSG);
+exec sql at :connJdSul call fc_autorizacao( :request ) into :response;
+				strcpy(conexao, (char *) CONNJDSUL);
+	       break;
+       case 2:
+       	       logMsg(REDEMAISMSG);
+       	       strcpy(conexao, (char *) CONNALFA);
+       	       
+	debug("fc_autorizacao\n");
+exec sql at :connAlfa call fc_autorizacao( :request ) into :response;
+	       break;
+       default:
+	       logMsg("Bin desconhecido\n");
+	       break;
+       }
+       if(route == 1 || route == 2) {
+	       logMsg( "sqlcode.code    : %d\n"   , sqlca.sqlcode );
+			sqlcode = sqlca.sqlcode;
+	       if( sqlcode != 0 ) {
+
+			logMsg( "sqlcode.call    : <%s>\n" , sqlca.sqlerrm.sqlerrmc );
+		       respPtr = (char *) NULL;
+	       }
+	       else  {
+		       logMsg( "Conexao Ativa Autorizacao Nova %s", conexao);
+		       // if(checkResponseSize(response)) {
+			       stripTraillingBlanks(response);
+			       respPtr = response;
+		       // }
+		       // else 
+		//	       respPtr = (char *) NULL;
+		       debug( "response : <%s>/%d\n" , response ,strlen(response));
+	       }
+       }
+       return(respPtr);
+}
+
+int checkResponseSize(char * resp) 
+{
+       int ret;
+       int len;
+       char respSiz[4];
+       ret = 1;
+	debug("checkResponseSize");
+       len = strlen(response);
+		      
+       strncpy( respSiz , response + 1 , 3 );
+       respSiz[3] = '\0';
+       
+       if( atoi(respSiz) != (len - 4) ) {
+	       logMsg( "sql_autorizacao->Wrong Size(%s !!!\n" , respSiz );
+	       ret = 0;
+       }
+       return ret;
+}
+
+void stripTraillingBlanks(char * str)
+{
+ char * ptr;
+ int len, count;
+ len = strlen(str);
+ ptr = str + len -1;
+ for (count = len -1 ; count >= 0 && *ptr == 0x20; count--) *ptr-- = '\0'; 
+} 
+
+int connectDB(char * user, char * pwd, char * host, char * database, char *nome)
+{
+       exec sql begin declare section;
+       char username[80], password[80], server[80], conexao[80];
+       exec sql end   declare section;
+	char buffer[100];
+       strcpy(username, user);
+       strcpy(password, pwd);
+       strcpy(conexao, nome);
+	if( database != NULL )
+    sprintf( username , "%s@%s" , user , database );
+       strcpy(server,host);
+       // exec sql connect :username IDENTIFIED BY :password AT :conexao USING :server;
+       exec sql connect :username IDENTIFIED BY :password AT :conexao;
+       logMsg( "sqlcode.connect : <%s>\n" , sqlca.sqlerrm.sqlerrmc );
+       if( sqlca.sqlcode != 0 ) {
+    		strcpy( buffer , sqlca.sqlerrm.sqlerrmc );
+   	 printf( "sqlcode.call    : <%s>\n" , buffer );
+	return -1;
+    	}
+  printf( "sqlcode.code    : %d\n"   , sqlca.sqlcode );	
+        printf( "Conexao nomeada estabelecida - 02.\n");
+       return 1;
+}
+
+
+void sql_error()
+{
+       exec SQL WHENEVER SQLERROR CONTINUE;
+       logMsg("\nOracle error detected:\n");
+       logMsg("\n% .70s \n", sqlca.sqlerrm.sqlerrmc);
+       exec SQL ROLLBACK WORK RELEASE;
+       exit(1);
+}

@@ -1,0 +1,21 @@
+CFLAGS=-I. 
+CC=cc
+
+
+PRODUCAO=./
+
+OBJ =	v_data.o v_util.o v_misc.o v_header.o fila.o  money.o bitmap.o \
+	storage.o
+
+all:	testeAuth
+
+	
+testeAuth : testeAuth.o  $(OBJ)
+	$(CC) -g -o $(PRODUCAO)testeAuth testeAuth.o $(OBJ) 
+testeAuth.o:
+	$(CC) -c $(CFLAGS) testeAuth.c
+
+
+clean:
+	rm *.o
+

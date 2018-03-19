@@ -1,0 +1,98 @@
+#include "sockhelp.h"
+#include <stdio.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <fila.h>
+
+void run(char *, int);
+void *ToNet(char *port, char *ip);
+void *FromNet(char *port, char *ip);
+
+
+extern int errno;
+FILE *logfd;	
+
+
+int main(int argc, char *argv[])
+{
+
+//	ignore_pipe();
+printf( "%s %d", argv[1], atoi(argv[2]));
+fflush(stdout);
+	run(argv[1], atoi(argv[2]));
+	return 0;
+}
+
+void run(char *ip, int port)
+{
+	int rc;
+	char porta[6];
+	
+	logMsgSetPrefix("TCP/IP Driver");
+	sprintf(porta,"%d", port);
+	logMsg("Porta %s\n", porta);
+
+		
+        if(fork())
+           FromNet(porta, ip);
+        else	
+          { ToNet (porta, ip); }
+}
+
+void *FromNet(char *porta, char *ip) {
+	int len;
+	char buffer[1024];
+
+	int sock = -1;
+	sock = make_connection(porta, ip);
+		
+        printf("FromNet com sock = %d\n", sock);
+	
+        logfd = (FILE *) logOn(logfd, "logtcp.log");
+
+	while(1) {
+		len = rcvFromNet(sock, buffer);
+		if(len > 0) {
+			logTcp(logfd, buffer,len,"From Visa"); 
+			gravaFila(FORMINQ, buffer, len);
+		}
+		else {
+			termina();
+		}
+
+	}
+	
+}
+
+void *ToNet(char *porta, char *ip) {
+	int len;
+	char buffer[1024];
+
+	int sock = -1;
+	sock = make_connection(porta, ip);
+
+        printf("ToNet com sock = %d\n", sock);
+	
+	while(1) {
+		len = leFila(DRIVERQ,buffer, sizeof(buffer));
+		if(len > 0) {
+			if(sendToNet(sock, buffer, len) < 0) termina();
+		}
+		else {
+			termina();
+		}
+	}
+
+}
+termina()
+{
+	if(logfd != (FILE *) NULL ) fclose(logfd);
+	sleep(1);
+	system("./onTcpError.sh");
+	exit(0);
+}
+
+
+

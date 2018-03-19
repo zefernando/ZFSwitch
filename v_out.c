@@ -1,0 +1,709 @@
+/*#ident "@(#) v_out.c 1.00 marco2005" */
+/*
+ *	Ext outbound handler. Messages are comming from the authorizer
+ *	are to be routed to the network.
+ *
+ *
+ *
+ *	Modification History
+ *
+ *	Who		When		Why
+ *	========================================================================
+ *
+ *
+ */
+
+#include <stdio.h>
+#include "cardco.h"
+#include "extern.h"
+#include "fila.h"
+
+
+
+extern_outbound()
+{
+	/*
+	 *	Read messages from the comm line and give to the switch
+	 */
+	unsigned char *extern_getbitmap();
+	unsigned char *p;
+	int	len;
+	int	msglen;
+	int	is300;
+	int	unit;
+	char    auxStr[20];
+	int i;
+
+	logMsgSetPrefix("ToVisa");
+
+
+	for(;;)
+	{
+		if(leFila(FORMOUTQ, &cardcomsg.msg, sizeof(cardcomsg.msg)) < 0)
+			break;
+
+		/* set the 03xx flag */
+		if(cardcoIs03xx(&cardcomsg))
+			is300 = 1;
+		else
+			is300 = 0;
+
+		/* If this was a reject message then ignore it */
+		if(cardcomsg.msg.respcode == CARDCO_RC_RejectMessage)
+		{
+			logMsg("Dropping response %d to reject message\n",
+			      cardcomsg.msg.msgtype);
+			continue;
+		}
+
+		logMsg("m%04d/a%010s/t%06ld/p%06ld/r%02ld\n",
+		      cardcomsg.msg.msgtype,cardcomsg.msg.acquirer, cardcomsg.msg.trace,
+		      cardcomsg.msg.pcode, cardcomsg.msg.respcode);
+
+
+		if(is300 && extern_support300 == 0)
+		{
+			/* This should never get here (302/312) */
+			logMsg("File/PVV update message not yet supported.\n");
+			continue;
+		}
+
+		if(cardcomsg.msg.msgtype == 200)
+			cardcomsg.msg.msgtype = 100;
+		else if(cardcomsg.msg.msgtype == 220)
+			cardcomsg.msg.msgtype = 120;
+
+
+		/* check if rev. on bal. inq. */
+		if(cardcoIsReversal(&cardcomsg)
+		                && cardcoGetProcessCode(cardcomsg.msg.pcode) == CC_ISO_BALANCE)
+		{
+			cardco_set_return_msgno(cardcomsg);
+			gravaFila(DRIVERQ, &cardcomsg.msg, sizeof(cardcomsg.msg));
+			continue;
+		}
+
+
+		/* Determine bitmap */
+		memset(v_NetworkIdBitmap, 0, sizeof(v_NetworkIdBitmap));
+		setBitOn(v_NetworkIdBitmap, 0);
+
+		memset(&externmsg, 0, sizeof(externmsg));
+		memset(externbuf, 0, sizeof(externbuf));
+
+		/* se a mensagem foi apenas roteada, usa o bitmap recebido.  */
+		sprintf(auxStr, "%04d", cardcomsg.msg.msgtype);
+		if (strcmp(cardcomsg.msg.filler1, auxStr) == 0)
+		{
+			debug("Mensagem %d foi apenas roteada.\n",cardcomsg.msg.msgtype);
+			debug("filler1 = ");
+			for (i = 0; i < 13; i++)
+				debug ("%02x", cardcomsg.msg.filler1[i]);
+			debug("\n");
+			externmsg.bitmap = cardcomsg.msg.filler1 + 5;
+		}
+		else
+		{
+			debug("Mensagem %d foi respondida localmente.\n",
+			      cardcomsg.msg.msgtype);
+			externmsg.bitmap = extern_getbitmap(&cardcomsg);
+
+		}
+		debug("Acceptor %s\n", cardcomsg.msg.acceptorname);	
+		if(cardcomsg.msg.respcode == CARDCO_RC_Approved && isPayBalance(&cardcomsg)) {
+				setBitOn(externmsg.bitmap, 48);
+
+		}
+		debug("Bits found:[");
+
+                        for(i = 1; i <= 128; ++i)
+				if ((isBitSet(externmsg.bitmap, i)) && ((i <= 64) || (isBitSet(externmsg.bitmap, 1))))
+                                       debug("%d,", i );
+		                       debug("]\n");
+
+		if(externmsg.bitmap == NULL)
+		{
+			logMsg("Unable to get bitmap for %d\n", cardcomsg.msg.msgtype);
+			continue;
+		}
+
+		p = &externbuf[4]; 
+		// p = externbuf; 
+		/* Build header and determine data pointers */
+		/*if(build_header(&cardcomsg, externbuf, &externmsg) < 0)*/
+		if(build_header(&cardcomsg, p, &externmsg) < 0)
+		{
+			logMsg("Error in building message header.\n");
+			continue;
+		}
+
+
+		/* Adjust values */
+		if(!is300)
+		{
+			if(cardco_to_extern(&cardcomsg, &externmsg) < 0)
+			{
+				/* Throw away the message */
+				logMsg("Error return from cardco_to_extern()\n");
+				continue;
+			}
+		}
+		else
+		{
+			/* Is a 300: Check what kind */
+			if(cardcoGetProcessCode(cardcomsg.msg.pcode) == CC_300_FILE_INQ
+			                || cardcoGetProcessCode(cardcomsg.msg.pcode) == CC_300_PVV_INQ)
+			{
+				setBitOn(externmsg.bitmap, 1);
+				setBitOn(externmsg.bitmap, 90);
+				setBitOff(externmsg.bitmap, 126);
+			}
+		}
+
+
+		/* Make fields into extern format */
+		msglen = len = cardcoToExtern(&cardcomsg, &externmsg);
+
+		/* Set the length of the message */
+		externmsg.header->message_length[0] = (len >> 8) & 0xff;
+		externmsg.header->message_length[1] = len & 0xff;
+
+		p = externbuf;
+		*p = 0xc2;
+	       	*(p + 1) = 0xc9;
+		*(p + 2) = 0xe9;
+		*(p + 3) = 0xe9;	
+		if(fmt_debug & CARDCO_FMT_DEBUGOUT)
+		{
+			int	i;
+
+			if( extern800debug ||
+			                ( msgType != CARDCO_NETWORK &&
+			                  msgType != CARDCO_NETWORK_RESPONSE) )
+			{
+				debug("Ext Out Length:%d\n<", len);
+				for(i = 0; i < len + 4; ++i)
+				{
+					if(i && (i % 35) == 0)
+						debug("\n");
+					debug("%02x", externbuf[i]);
+				}
+				debug(">\n");
+				/*
+				 * this was outside the "if (extern800debug etc
+				 * so it was printed to 800 messages also
+				 */
+				/* extern_print_header(externbuf);*/
+			}
+
+		}
+
+
+
+		/* Send the message */
+		if(cardcomsg.msg.msgtype == CARDCO_AUTHREQ_ADVICE_RESPONSE)
+			continue;
+
+
+		if(gravaFila(DRIVERQ, externbuf, msglen + 4) < 0)
+		{
+			logMsg("Nao foi possivel gravar fila(%d, externbuf, %d)\n",
+			      DRIVERQ, len);
+			break;
+		}
+
+	}
+}
+
+cardco_to_extern(struct cardco *cardcoPtr, struct cardcoexternmsg *externmsg)
+{
+	/*
+	 *	Make adjustments to the extern message
+	 */
+	int	ret;
+
+	/* Determine transaction type from processing code */
+	if(extern_make_externpcode(cardcoPtr, externmsg) < 0)
+		return(-1);
+
+//	cardco_to_extern_poscodes(cardcoPtr);
+
+	/* Map response and revreason codes */
+	switch(cardcoPtr->msg.msgtype){
+	case	CARDCO_AUTHREQ:
+	case	CARDCO_AUTHREQ_REPEAT:
+	case	CARDCO_AUTHREQ_ADVICE:
+	case	CARDCO_FINREQ:
+	case	CARDCO_FINREQ_REPEAT:
+	case	CARDCO_FINREQ_ADVICE:
+		ret = extern_externauthreq(cardcoPtr, externmsg);
+		break;
+
+	case	CARDCO_AUTHREQ_RESPONSE:
+	case	CARDCO_FINREQ_RESPONSE:
+		ret = extern_externauthresp(cardcoPtr, externmsg);
+		break;
+
+	case	CARDCO_REVREQ:
+	case	CARDCO_REVREQ_REPEAT:
+	case	CARDCO_REVREQ_ADVICE:
+	case	CARDCO_AUTHCOMP:		/*	actualy a reversal */
+		ret = extern_externrevreq(cardcoPtr, externmsg);
+		break;
+
+	case	CARDCO_REVREQ_RESPONSE:
+		ret = extern_externrevresp(cardcoPtr, externmsg);
+		break;
+
+	case	CARDCO_STLMTREQ:
+	case	CARDCO_STLMTREQ_RESPONSE:
+	case	CARDCO_STLMTREQ_ADVICE:
+	case	CARDCO_STLMTREQ_ADVICE_RESPONSE:
+		ret = extern_externsettlement(cardcoPtr, externmsg);
+		break;
+
+	case	CARDCO_ADMIN_ADVICE:
+	case	CARDCO_ADMIN_ADVICE_RESPONSE:
+		ret = extern_externadmin(cardcoPtr, externmsg);
+		break;
+
+	case	CARDCO_NETWORK:
+	case	CARDCO_NETWORK_RESPONSE:
+		ret = extern_externnetwork(cardcoPtr, externmsg);
+		break;
+
+	case	302:
+	case	312:
+		/* File update stuff: We just pass this on as is */
+		break;
+
+	default:
+		break;
+	}
+
+
+	return(ret);
+}
+
+
+
+cardco_to_extern_poscodes(register struct cardco *cardcoPtr)
+{
+	int i;
+
+	/* Set the conditon codes and other stuff */
+	switch(cardcoPtr->msg.pos_entry_code / 10){
+	case	CC_POS_PANENTRY_UNKNOWN:	i = 0; break;
+	case	CC_POS_PANENTRY_MANUAL:		i = 1; break;
+	case	CC_POS_PANENTRY_MAGSTRIP:	i = 2; break;
+	case	CC_POS_PANENTRY_BARCODE:	i = 3; break;
+	case	CC_POS_PANENTRY_OCR:		i = 4; break;
+	case	CC_POS_PANENTRY_IC:		i = 5; break;
+	case	CC_POS_PANENTRY_TRK1OR2:	i =90; break;
+	default: 				i = 0; break;
+	}
+
+	i = i * 10;
+
+	switch(cardcoPtr->msg.pos_entry_code % 10){
+	case	CC_POS_PINENTRY_UNKNOWN:	i += 0;	break;
+	case	CC_POS_PINENTRY_HASCAP:		i += 1;	break;
+	case	CC_POS_PINENTRY_NOCAP:		i += 2;	break;
+	case	CC_POS_PINENTRY_INOPERATIVE:	i += 8;	break;
+	case	CC_POS_PINENTRY_VERIFIED:	i += 9;	break;
+	default: 				i += 0; break;
+	}
+
+	cardcoPtr->msg.pos_entry_code = i;
+	i = 0;
+
+	switch(cardcoPtr->msg.pos_condition_code & CC_POS_COND_REQ_MASK){
+	case	CC_POS_COND_REQ_NORMAL:		i = 0;	break;
+	case	CC_POS_COND_REQ_PREAUTH:	i = 6;	break;
+	case	CC_POS_COND_REQ_MAIL:		i = 8;	break;
+	default:
+		if(cardcoPtr->msg.pos_condition_code == 0)
+			i = 1;
+		else if(cardcoPtr->msg.pos_condition_code & CC_POS_COND_AVS)
+			i = 51;
+		else if(cardcoPtr->msg.pos_condition_code & CC_POS_COND_SUSPECT)
+			i = 3;
+		else if(cardcoPtr->msg.pos_condition_code & CC_POS_COND_CUSTPRESENT)
+			i = 5;
+		else if(cardcoPtr->msg.pos_condition_code & CC_POS_COND_IDENTITY_VER)
+			i = 10;
+		break;
+	}
+
+	if(i == 0)
+		if(cardcoPtr->msg.pos_cap_code & CC_POS_CAP_UNATTENDED)
+			i = 2;
+
+	cardcoPtr->msg.pos_condition_code = i;
+
+
+
+	if(cardcoPtr->msg.pos_cap_code & CC_POS_CAP_UNSPECIFIED)
+		i = 0;
+	else if(cardcoPtr->msg.pos_cap_code & CC_POS_CAP_UNATTENDED)
+		i = 2;
+	else if(cardcoPtr->msg.pos_cap_code & CC_POS_CAP_ECR)
+		i = 4;
+	else if(cardcoPtr->msg.pos_cap_code & CC_POS_CAP_DIALTERM)
+		i = 7;
+	else
+		i = 0;
+
+	i = i * 10;
+	if(cardcoPtr->msg.pos_cap_code & CC_POS_CAP_NOCARDREAD)
+		i += 9;
+	else
+		i = i + cardcoPtr->msg.pos_entry_code / 10;
+
+	cardcoPtr->msg.pos_cap_code = i;
+	return(0);
+}
+
+
+
+
+
+extern_make_externpcode(struct cardco *cardcoPtr, struct cardcoexternmsg *externmsg)
+{
+	int		txn, from_acct, to_acct;
+
+	/*
+	 *	format the transaction type and the account types
+	 */
+	txn = cardcoPtr->msg.pcode / 10000;
+	from_acct = cardcoPtr->msg.pcode / 100 % 100;
+	to_acct = cardcoPtr->msg.pcode % 100;
+
+
+	switch(txn){
+	case	CC_ISO_G_AND_S		: txn = 0;	break;
+	case	CC_ISO_WD		: txn = 1;	break;
+	case	CC_ISO_DEBIT_ADJUST	: txn = 2;	break;
+	case	CC_ISO_CHECK_GUAR	: txn = 3;	break;
+	case	CC_ISO_CHECK_VER	: txn = 3;	break;
+	case	CC_ISO_G_AND_S_CASH	: txn = 0;	break;
+	case	CC_ISO_CACC_ADVANCE	: txn = 1;	break;
+	case	CC_ISO_PURCH_RETURN	: txn = 20;	break;
+	case	CC_ISO_DEPOSIT		: txn = 21;	break;
+	case	CC_ISO_CREDIT_ADJUST	: txn = 22;	break;
+	case	CC_ISO_BALANCE		: txn = 30;	break;
+	case	CC_ISO_TRANSFER		: txn = 40;	break;
+
+	default:
+		logMsg("Transaction '%d' is not defined for Ext.\n", txn);
+		break;
+	}
+
+
+	from_acct = make_acct_code_out(from_acct);
+	to_acct = make_acct_code_out(to_acct);
+
+	cardcoPtr->msg.pcode = txn * 10000 + from_acct * 100 + to_acct;
+	return(0);
+}
+
+
+
+make_acct_code_out(int acct)
+{
+	switch(acct){
+		/*default:*/
+	case	CC_ACCT_DEFAULT:	acct = 0;	break;
+	case	CC_ACCT_SAV:		acct = 10;	break;
+	case	CC_ACCT_CHECK:		acct = 20;	break;
+	case	CC_ACCT_CC:		acct = 30;	break;
+	case	CC_ACCT_UNIVERSAL:	acct = 40;	break;
+	}
+
+	return(acct);
+}
+
+
+extern_externauthreq(struct cardco *cardcoPtr, struct cardcoexternmsg *externmsg)
+{
+	/*
+	 *	Format an outbound authorization request
+	 *	My device/I set the bit map
+	 */
+	char	*p;
+	char	xbuf[50];
+
+	set_pin_and_track(cardcoPtr, externmsg);
+
+	/* check for purchase with cash back */
+	if(cardcoIsPurchWithCash(cardcoPtr->msg.pcode))
+		setBitOn(externmsg->bitmap, 60);
+
+	if(cardcoPtr->msg.life_cycle > 0)
+		setBitOn(v_NetworkIdBitmap, 1);
+
+	if(cardcoIsATM(cardcoPtr))
+		setBitOn(externmsg->bitmap, 42);
+
+	/* always ask for priority routing */
+	cardcoPtr->msg.serial_1 = 0;
+
+	/* perform adjustments on issuer/acquirer etc */
+
+	/*	=========
+		setBitOff(externmsg->bitmap, 44);
+		if(cardco_isbitset(externmsg->bitmap, 44))
+		{
+			p = cardco_locate_track_data(cardcoPtr);
+			memcpy(xbuf, p, 4);
+			xbuf[4] = 0;
+			sprintf(cardcoPtr->msg.track2, "=%s", xbuf);
+			setBitOff(externmsg->bitmap, 44);
+		}
+	        ========= */
+
+	/*if(cardcoPtr->msg.termid[0] == '\0' || cardcoPtr->msg.pos_entry_code == 0)*/
+	if(cardcoPtr->msg.termid[0] == '\0')
+		setBitOff(externmsg->bitmap, 40);
+
+	if(cardcoPtr->msg.termloc[0] == '\0')
+		setBitOff(externmsg->bitmap, 41);
+
+
+	return(0);
+}
+
+
+extern_externauthresp(struct cardco *cardcoPtr, register struct cardcoexternmsg *externmsg)
+{
+	/*
+	 * 	I was sent the 100 and now I am replying
+	 */
+
+	struct	private_data	*pd;
+
+	pd = (struct private_data *)cardcoPtr->msg.formatter_use;
+
+	extern_externrespcode(cardcoPtr);
+
+	logMsg("Resp for %d trace %d is %d\n",
+	      cardcoPtr->msg.msgtype, cardcoPtr->msg.trace,cardcoPtr->msg.respcode);
+
+	if(cardcoPtr->msg.respcode != 0)
+		/*	bit 38 no authorization response */
+		setBitOff(externmsg->bitmap, 37);
+	else {
+		/* moved the test bellow to outside the else branch */
+	}
+
+	/*
+	 * and changed to use length62 (private_data) instead of
+	 * pos_pin_cap_code
+	if(cardcoPtr->msg.pos_pin_cap_code == 'A' ||
+		cardcoPtr->msg.pos_pin_cap_code == 'E')
+	 */
+	if (pd->length62)
+		setBitOn(externmsg->bitmap,61);
+
+	/* This is a POS or non-atm transaction */
+	adjust_bitmap(externmsg->bitmap, pd->bitmap, 23, 41, 42, -1);
+
+	/* restore the network id bitmap */
+	memcpy(v_NetworkIdBitmap, pd->netidbitmap, 2);
+
+	return(0);
+}
+
+
+extern_externrevreq(struct cardco *cardcoPtr, struct cardcoexternmsg *externmsg)
+{
+	/*
+	 *	format reversal request
+	 */
+	struct	private_data	*pd;
+
+	pd = (struct private_data *)cardcoPtr->msg.formatter_use;
+
+	set_pin_and_track(cardcoPtr, externmsg);
+	cardcoPtr->msg.origmsg = 100;
+
+	/* There is no response code in EXT reversal */
+
+	/* set the message reason code bit (field 63)) */
+
+	if(cardcoPtr->msg.respcode == CARDCO_RC_PartialDispense ||
+	                cardcoPtr->msg.revcode  == CARDCO_RR_PartialDispense)
+		/*	Set bit to force replacement amount */
+		setBitOn(externmsg->bitmap, 94);
+
+	setBitOff(externmsg->bitmap, 34);
+	setBitOff(externmsg->bitmap, 44);
+
+	/*if(cardcoPtr->msg.termid[0] == '\0' || cardcoPtr->msg.pos_entry_code == 0)*/
+	if(cardcoPtr->msg.termid[0] == '\0')
+		setBitOff(externmsg->bitmap, 40);
+
+	if(cardcoPtr->msg.termloc[0] == '\0')
+		setBitOff(externmsg->bitmap, 41);
+
+	return(0);
+}
+
+
+
+
+extern_externrevresp(struct cardco *cardcoPtr, struct cardcoexternmsg *externmsg)
+{
+	/*
+	 *	Reversal request response
+	 */
+	struct	private_data	*pd;
+
+	pd = (struct private_data *)cardcoPtr->msg.formatter_use;
+	extern_externrespcode(cardcoPtr);
+
+	/* restore the network id bitmap */
+	memcpy(v_NetworkIdBitmap, pd->netidbitmap, 2);
+
+	/* This is a POS or non-atm transaction */
+	adjust_bitmap(externmsg->bitmap, pd->bitmap, 23, 41, 42, -1);
+
+	if(cardcoPtr->msg.revcode  == CARDCO_RR_PartialDispense ||
+	                cardcoPtr->msg.respcode == CARDCO_RC_PartialDispense)
+		setBitOn(externmsg->bitmap, 94);
+
+	/* Set respcode to 0 */
+	if(cardcoPtr->msg.respcode != 21)
+		cardcoPtr->msg.respcode = 0;
+	else
+		setBitOff(externmsg->bitmap, 37);
+
+	if (pd->length62)
+		setBitOn(externmsg->bitmap,61);
+
+	return(0);
+}
+
+
+
+
+extern_externnetwork(struct cardco *cardcoPtr, struct cardcoexternmsg *externmsg)
+{
+	/*
+	 *	Network message
+	 */
+
+
+	/* Map the netcode */
+	switch(cardcoPtr->msg.netcode){
+	case	CARDCO_NET_SIGNON_START:
+	case	CARDCO_NET_SIGNON:
+		cardcoPtr->msg.netcode = 1;
+		break;
+
+	case	CARDCO_NET_SIGNOFF_START:
+	case	CARDCO_NET_SIGNOFF:
+		cardcoPtr->msg.netcode = 2;
+		break;
+
+	case	CARDCO_NET_START_SAF:
+		cardcoPtr->msg.netcode = 60;
+		break;
+
+	case	CARDCO_NET_KEYS:
+		cardcoPtr->msg.netcode = 101;
+		break;
+
+	case	CARDCO_NET_ECHO:
+		cardcoPtr->msg.netcode = 301;
+		break;
+
+	case	CARDCO_NET_ECHO_START:
+		cardcoPtr->msg.netcode = 301;
+		break;
+
+	case	CARDCO_NET_ENTER_SI:
+		cardcoPtr->msg.netcode = 68;
+		break;
+
+	case	CARDCO_NET_EXIT_SI:
+		cardcoPtr->msg.netcode = 69;
+		break;
+
+	default: cardcoPtr->msg.netcode = 301;
+		break;
+	}
+
+	return(0);
+}
+
+
+extern_externadmin(struct cardco *cardcoPtr, struct cardcoexternmsg *vmsg)
+{
+}
+
+extern_externsettlement(struct cardco *cardcoPtr, struct cardcoexternmsg *vmsg)
+{
+}
+
+
+extern_externrespcode(struct cardco *cardcoPtr)
+{
+	register	int ret;
+
+	switch(cardcoPtr->msg.respcode){
+	case	CARDCO_RC_Approved:			ret =  0; break;
+	case	CARDCO_RC_ReferCardIssuer:		ret =  1; break;
+	case	CARDCO_RC_InvalidMerchant:		ret =  3; break;
+	case	CARDCO_RC_DoNotHonor:			ret =  5; break;
+	case	CARDCO_RC_UnableToProcess:		ret =  5; break;
+	case	CARDCO_RC_InvalidTransaction:		ret = 12; break;
+	case	CARDCO_RC_IssuerTimeout:		ret = 19; break;
+	case	CARDCO_RC_InvalidAmount:		ret =  5; break;
+	case	CARDCO_RC_InvalidCard:			ret = 14; break;
+	case	CARDCO_RC_InvalidCaptureDate:		ret =  5; break;
+	case	CARDCO_RC_SystemErrorReenter:		ret = 19; break;
+	case	CARDCO_RC_MessageFormatError:		ret = 19; break;
+	case	CARDCO_RC_HotCard:			ret = 41; break;
+	case	CARDCO_RC_SpecialPickup:		ret =  7; break;
+	case	CARDCO_RC_HotCardPickUp:		ret = 43; break;
+	case	CARDCO_RC_NoFunds:			ret = 51; break;
+	case	CARDCO_RC_ExpiredCard:			ret = 54; break;
+	case	CARDCO_RC_IncorrectPIN:			ret = 55; break;
+	case	CARDCO_RC_ExceedsLimit:			ret =  5; break;
+	case	CARDCO_RC_RestrictedCard:		ret = 62; break;
+	case	CARDCO_RC_MACKeyError:			ret = 19; break;
+	case	CARDCO_RC_ExceedsFreqLimit:		ret = 82; break;
+	case	CARDCO_RC_RetainCard:			ret =  4; break;
+	case	CARDCO_RC_ExceedsPINRetry:		ret = 75; break;
+	case	CARDCO_RC_InvalidAccount:		ret = 52; break;
+	case	CARDCO_RC_NoSharingArrangement:		ret = 19; break;
+	case	CARDCO_RC_FunctionNotAvailable:		ret = 19; break;
+	case	CARDCO_RC_PINKeyError:			ret = 19; break;
+	case	CARDCO_RC_MACSyncError:			ret = 19; break;
+	case	CARDCO_RC_SwitchNotAvailable:		ret = 19; break;
+	case	CARDCO_RC_InvalidIssuer:		ret = 19; break;
+	case	CARDCO_RC_InvalidAcquirer:		ret = 19; break;
+	case	CARDCO_RC_InvalidOriginator:		ret = 19; break;
+	case	CARDCO_RC_SystemError:			ret = 96; break;
+	case	CARDCO_RC_DuplicateReversal:		ret = 21; break;
+	case	CARDCO_RC_NoOriginal:			ret = 21; break;
+	case	CARDCO_RC_UnableToReverse:		ret = 21; break;
+	case	CARDCO_RC_TxnNotPermittedOnCard:	ret = 57; break;
+		/*      ====
+			case	CARDCO_RC_UnderMinTxnAmt:		ret = 13; break;
+			case	CARDCO_RC_UnderMinParc:		ret = 13; break;
+			case	CARDCO_RC_CardBornBlocked:		ret = 14; break;
+			case	CARDCO_RC_BadTrack3:		ret = 14; break;
+			==== */
+	default:				ret =  5; break;
+	}
+
+	cardcoPtr->msg.respcode = ret;
+	return(ret);
+}
+
+cardco_set_return_msgno(struct cardco cardcoPtr)
+{
+	                 cardcoPtr.msg.msgtype += 10;
+}

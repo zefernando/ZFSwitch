@@ -1,0 +1,29 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define SQLCA_STORAGE_CLASS extern
+#define ORACA_STORAGE_CLASS extern
+#include <sqlcpr.h>
+
+callFcPagamento(char * req, char * resp, char * nome)
+{
+	char buffer[100];
+
+  exec sql begin declare section;
+        char request[512], response[512], conexao[80];
+  exec sql end   declare section;
+
+        strcpy(request,req);
+        strcpy(response, resp);
+        strcpy(conexao, nome);
+        debug("conexao %s\n", conexao);
+  	exec sql at :conexao call fc_pagamento( :request ) into :response;
+        if( sqlca.sqlcode != 0 ) {
+                strcpy( buffer , sqlca.sqlerrm.sqlerrmc );
+                printf( "sqlcode.call    : <%s>\n" , buffer );
+                return -1;
+        }
+ 
+
+  }
+

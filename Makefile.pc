@@ -1,0 +1,25 @@
+ORADIR=/app/oracle/product/8.1.7
+ORALIBS=-L$(ORADIR)/precomp/lib/ -L$(ORADIR)/lib
+SQL_LIB=-lproc2 -lclntsh 
+CFLAGS=-I. -I/app/oracle/product/8.1.7/precomp/public
+INCLUDE=include=(.,/usr/lib/gcc-lib/i386-redhat-linux/3.2.2/include,/usr/include)
+CC=gcc -Wall -g
+
+ifdef DEBUG
+	CC += -DDEBUG=1
+endif
+
+all: auth 
+
+clean:
+	clear
+	rm -f auth  auth.o
+
+auth: auth.o fila.o v_misc.o v_data.o
+	$(CC) $(ORALIBS) -o auth auth.o\
+	fila.o v_misc.o v_data.o v_util.o \
+	$(SQL_LIB)
+
+auth.o: auth.pc fila.o v_misc.o v_data.o v_util.o
+	proc iname=auth.pc $(INCLUDE) CODE=C
+	$(CC) -w -c $*.c -I$(ORADIR)/precomp/public

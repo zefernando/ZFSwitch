@@ -1,0 +1,16 @@
+ORADIR=/u01/oracle/9.2.0
+ORALIBS=-L$(ORADIR)/precomp/lib/ -L$(ORADIR)/lib
+SQL_LIB=-lproc2 -lclntsh 
+CFLAGS=-I. -I/u01/oracle/9.2.0/precomp/public
+INCLUDE=include=(.,/usr/lib/gcc-lib/i386-redhat-linux/3.3.4/include,/usr/include)
+CC=gcc -Wall -g
+
+ifdef DEBUG
+	CC += -DDEBUG=1
+endif
+
+all:  pgto.c
+
+
+pgto.c: pagamento.pc 
+	proc iname=pagamento.pc $(INCLUDE) CODE=C

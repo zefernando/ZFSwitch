@@ -1,0 +1,2 @@
+10.90.1.2 root/card420
+10.90.1.5 scm/Card19mes
